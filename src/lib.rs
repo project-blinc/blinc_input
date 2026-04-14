@@ -33,13 +33,21 @@
 //! input.frame_end();  // clear just_pressed / scroll_delta for next frame
 //! ```
 //!
-//! # Focus caveat
+//! # Event routing
 //!
-//! Key events only reach a `Div` while it has keyboard focus (that's
-//! a Blinc contract — it applies to every `on_key_*` handler, not
-//! something this crate introduces). Attach [`capture_input`] to the
-//! root of your sketch's tree and ensure that root captures focus,
-//! or explicitly request focus on the child that wraps your canvas.
+//! Inherits Blinc's dispatch rules — not invented here:
+//!
+//! - **Pointer + scroll** bubble through every ancestor of the hit /
+//!   hovered element, so `capture_input(&root)` reliably sees every
+//!   pointer-down / up / move / scroll regardless of subtree shape.
+//! - **Keys** bubble leaf-to-root and stop at the first handler found.
+//!   Focus is set implicitly on pointer-down — the clicked node *and*
+//!   its full ancestor chain become focused, so keys reach your `Div`
+//!   after the first click inside its subtree. But any descendant that
+//!   handles keys itself (`text_input`, `code_editor`, or a child with
+//!   its own `on_key_down`) will absorb the event and `capture_input`
+//!   will never see it. Don't nest key-capturing widgets inside a
+//!   region you want `blinc_input` to drive.
 //!
 //! [`DivInputExt::capture_input`]: DivInputExt::capture_input
 

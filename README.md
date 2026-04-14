@@ -42,12 +42,24 @@ input.frame_end();  // clear edge-triggered state for next frame
 See [BACKLOG.md](./BACKLOG.md) for planned additions — gamepad,
 virtual axis mapping, touch tracking, action-binding layer.
 
-## Focus caveat
+## Event routing — what's reliable and what isn't
 
-Key events only reach a `Div` while it has keyboard focus (that's a
-Blinc contract, not something `blinc_input` introduces). Either attach
-`capture_input` to a `Div` that receives focus, or request focus on
-the child that wraps your canvas.
+Built on top of Blinc's event router, so behavior inherits Blinc's
+rules:
+
+- **Pointer + scroll** bubble through every ancestor of the hit / hovered
+  element. `capture_input(&root)` reliably sees every pointer-down,
+  pointer-up, pointer-move, and scroll — no caveat.
+- **Keys** bubble *leaf-to-root and stop at the first handler*. Focus
+  is set implicitly on pointer-down (the clicked node *and* its full
+  ancestor chain become focused); clicking outside clears it. So:
+  - In a sketch whose subtree has no child key handlers, keys reach
+    `capture_input` after the first pointer-down anywhere inside.
+  - If the subtree contains a widget that handles keys itself
+    (`text_input`, `code_editor`, custom `on_key_down` on a child),
+    that descendant absorbs the key and `capture_input` never sees it.
+    Keep key-capturing widgets outside the region you want to drive
+    with `blinc_input`, or read from them directly.
 
 ## License
 
