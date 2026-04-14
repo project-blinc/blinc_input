@@ -6,31 +6,44 @@
 //! `is_key_down(KeyCode::SPACE)` or `mouse_position()`. This crate
 //! bridges the two.
 //!
-//! [`InputState`] owns the polling snapshot. Hand it to the event
-//! system via [`DivInputExt::capture_input`] (or register handlers
-//! manually and call [`InputState::record`] from each one), then
-//! query it from `draw`. Call [`InputState::frame_end`] once per
-//! frame to clear transient edge-trigger state
+//! [`InputState`] owns the polling snapshot. Feed it from Blinc's event
+//! stream and query it from `draw`. Call [`InputState::frame_end`] once
+//! per frame to clear transient edge-trigger state
 //! (`is_key_just_pressed` / `is_mouse_just_pressed`).
 //!
-//! # Example
+//! # Recommended wiring — via `blinc_canvas_kit`
+//!
+//! If you're building on `Sketch` or `CanvasKit`, route events through
+//! canvas-kit's hooks — they're already scoped to the canvas's own
+//! bounds so you don't touch `Div` handles yourself:
 //!
 //! ```ignore
-//! use blinc_input::{InputState, DivInputExt, MouseButton};
-//! use blinc_core::events::KeyCode;
+//! // Inside sketch(...):
+//! use blinc_canvas_kit::prelude::*;   // brings in SketchEvents
+//! use blinc_input::InputState;
 //!
 //! let input = InputState::new();
+//! let i = input.clone();
+//! let tree = sketch("demo", my_sketch).on_canvas_events(move |e| i.record(e));
+//! ```
 //!
-//! let tree = div()
-//!     .w_full().h_full()
-//!     .capture_input(&input)
-//!     .child(/* … */);
+//! ```ignore
+//! // Inside CanvasKit:
+//! let mut kit = CanvasKit::new("main");
+//! let i = input.clone();
+//! kit.on_any_event(move |e| i.record(e));
+//! ```
 //!
-//! // Inside your sketch's draw():
-//! if input.is_key_down(KeyCode::SPACE) { /* jump! */ }
-//! if input.is_mouse_just_pressed(MouseButton::Left) { /* fire */ }
-//! let (mx, my) = input.mouse_position();
-//! input.frame_end();  // clear just_pressed / scroll_delta for next frame
+//! # Bare-Div escape hatch
+//!
+//! If you're not using canvas-kit, the [`DivInputExt::capture_input`]
+//! helper attaches the same bundle of handlers to any `Div`:
+//!
+//! ```ignore
+//! use blinc_input::{InputState, DivInputExt};
+//!
+//! let input = InputState::new();
+//! let tree = div().w_full().h_full().capture_input(&input).child(/* … */);
 //! ```
 //!
 //! # Event routing

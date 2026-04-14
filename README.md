@@ -8,24 +8,55 @@ Sketches and games typically want the *polling* shape: inside `draw()`,
 ask `is_key_down(KeyCode::SPACE)` or `mouse_position()`. `blinc_input`
 bridges the two.
 
+## Recommended wiring
+
+Route events through **`blinc_canvas_kit`** if you're using it — both
+`Sketch` and `CanvasKit` already scope events to their canvas so you
+don't need to touch `Div` handles yourself:
+
 ```rust
-use blinc_input::{InputState, DivInputExt, MouseButton};
+// With `sketch(...)`:
+use blinc_canvas_kit::prelude::*;   // includes SketchEvents
+use blinc_input::InputState;
 use blinc_core::events::KeyCode;
 
 let input = InputState::new();
+let i = input.clone();
+let tree = sketch("demo", my_sketch).on_canvas_events(move |e| i.record(e));
+```
 
-// Wire event handlers on the root of your tree:
-let tree = div().w_full().h_full().capture_input(&input)
-    .child(/* … */);
+```rust
+// With `CanvasKit` (interactive node graphs, editors):
+let mut kit = CanvasKit::new("main");
+let i = input.clone();
+kit.on_any_event(move |e| i.record(e));
+```
 
-// Inside your Sketch::draw:
-if input.is_key_down(KeyCode::SPACE)        { /* jump */ }
+Inside your draw loop, poll freely:
+
+```rust
+if input.is_key_down(KeyCode::SPACE)              { /* jump */ }
 if input.is_mouse_just_pressed(MouseButton::Left) { /* fire */ }
 let (mx, my) = input.mouse_position();
 let (sx, sy) = input.scroll_delta();
 
 input.frame_end();  // clear edge-triggered state for next frame
 ```
+
+## Bare `Div` escape hatch
+
+If you're not using `blinc_canvas_kit`, attach the same bundle of
+handlers directly via the [`DivInputExt::capture_input`] helper:
+
+```rust
+use blinc_input::{DivInputExt, InputState};
+
+let input = InputState::new();
+let tree = div().w_full().h_full().capture_input(&input)
+    .child(/* … */);
+```
+
+[`DivInputExt::capture_input`]: ./src/lib.rs
 
 ## What's tracked
 
