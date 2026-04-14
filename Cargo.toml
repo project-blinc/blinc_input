@@ -1,0 +1,18 @@
+[package]
+name = "blinc_input"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Polling-style input state for Blinc sketches and canvases — bridges callback events to is_key_down / mouse_position / etc."
+repository = "https://github.com/project-blinc/blinc_input"
+readme = "README.md"
+rust-version = "1.75"
+keywords = ["input", "gamepad", "keyboard", "creative-coding", "blinc"]
+categories = ["game-development", "gui"]
+
+# Standalone package — not a member of the Blinc workspace.
+
+[dependencies]
+# Path deps during local dev; swap for crates.io versions once published.
+blinc_core = { path = "../../crates/blinc_core" }
+blinc_layout = { path = "../../crates/blinc_layout" }
