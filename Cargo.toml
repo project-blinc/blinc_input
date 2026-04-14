@@ -13,6 +13,9 @@ categories = ["game-development", "gui"]
 # Standalone package — not a member of the Blinc workspace.
 
 [dependencies]
-# Path deps during local dev; swap for crates.io versions once published.
-blinc_core = { path = "../../crates/blinc_core" }
-blinc_layout = { path = "../../crates/blinc_layout" }
+# Each Blinc dep declares both `path` (used during local dev) and `git`
+# (used when this crate is fetched from its upstream repo by a
+# downstream consumer). See `blinc_gltf/Cargo.toml` for the full
+# rationale. Bump in lockstep with the corresponding upstream commits.
+blinc_core = { path = "../../crates/blinc_core", git = "https://github.com/project-blinc/Blinc.git", rev = "4a7cef2acf9ba3d0c87dbf9be91c63e0a612f295" }
+blinc_layout = { path = "../../crates/blinc_layout", git = "https://github.com/project-blinc/Blinc.git", rev = "4a7cef2acf9ba3d0c87dbf9be91c63e0a612f295" }
