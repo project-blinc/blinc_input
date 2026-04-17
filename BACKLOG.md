@@ -41,15 +41,20 @@ Outstanding work, ordered by demand.
 
 ## Action / axis binding layer
 
-- [ ] **Named actions over raw keys/buttons**
-  - **Why:** Game conventions want `input.action("jump")` not
-    `is_key_down(KeyCode::SPACE)`; remappable keybinds follow.
-  - **How:** `ActionMap` that configures one or more bindings per
-    action name (key, button, axis threshold); `input.action_down`,
-    `input.action_just_pressed`, `input.axis("move_x") -> f32` for
-    virtual axes derived from key pairs or gamepad sticks.
+- [x] **Named actions over raw keys/buttons.** `ActionMap` with
+  `Binding` (Key / Mouse / GamepadButton / GamepadAxisThreshold)
+  and `AxisBinding` (KeyPair / GamepadAxis / GamepadButtonPair).
+  `InputState::{action_down, action_just_pressed,
+  action_just_released, axis}`. Actions resolve via OR across
+  bindings; axes resolve via largest-magnitude. Install via
+  `InputState::set_actions`; swap to rebind. Introspection via
+  `ActionMap::{actions, axes}` iterators for rebind UIs.
 
 - [ ] **Binding persistence** to TOML/JSON for user-facing rebind UIs.
+  Needs `serde` derives on `Binding` / `AxisBinding` / `ActionMap`
+  behind an optional feature. Not started — the in-memory
+  `ActionMap` is the foundation; serialization is mechanical once
+  an app wants it.
 
 ---
 

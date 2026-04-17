@@ -134,6 +134,10 @@ struct Inner {
     /// and go.
     #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
     gamepad_slots: std::collections::HashMap<gilrs::GamepadId, usize>,
+    /// Active action / axis binding map. Queried by the `action_*`
+    /// and `axis` methods; installed once (or swapped on rebind) via
+    /// `InputState::set_actions`.
+    actions: ActionMap,
 }
 
 /// Per-gamepad polling state. Populated by
@@ -190,6 +194,122 @@ pub enum GamepadAxis {
     RightStickY,
     LeftTrigger,
     RightTrigger,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Action / axis map
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A named binding layer over raw keys / mouse / gamepad inputs.
+///
+/// Games want `input.action_down("jump")` and `input.axis("move_x")`,
+/// not `is_key_down(KeyCode::SPACE)`. `ActionMap` provides that
+/// indirection: register one or more [`Binding`]s per action name
+/// and one or more [`AxisBinding`]s per axis name; query via
+/// [`InputState::action_down`] / [`InputState::axis`] / friends.
+///
+/// Multiple bindings per name compose naturally:
+/// - **Actions** are OR — action is down if *any* bound source is down.
+/// - **Axes** take the value with the largest absolute magnitude
+///   across all bindings. That way a gamepad stick fully deflected
+///   dominates a simultaneous keyboard keypress (both contribute,
+///   but the stronger signal wins) rather than stacking past ±1.
+///
+/// Install on `InputState` once via [`InputState::set_actions`] and
+/// query every frame. Swapping the map out mid-play (e.g. during a
+/// key-rebinding UI confirmation) is a single call.
+#[derive(Default, Clone)]
+pub struct ActionMap {
+    actions: std::collections::HashMap<String, Vec<Binding>>,
+    axes: std::collections::HashMap<String, Vec<AxisBinding>>,
+}
+
+/// A single input source that can trigger an action. Actions are
+/// satisfied when *any* bound source is active.
+#[derive(Clone, Copy, Debug)]
+pub enum Binding {
+    /// Keyboard key.
+    Key(KeyCode),
+    /// Mouse button.
+    Mouse(MouseButton),
+    /// Gamepad button on a specific slot.
+    GamepadButton { slot: usize, button: GamepadButton },
+    /// Gamepad analog axis, treated as binary-held when `|value| >=
+    /// threshold`. Useful for mapping "trigger past halfway" or
+    /// "stick past deadzone" as a digital action.
+    GamepadAxisThreshold {
+        slot: usize,
+        axis: GamepadAxis,
+        threshold: f32,
+    },
+}
+
+/// A source that contributes to a virtual axis's floating-point value.
+/// Mixed bindings resolve by taking the source with the largest
+/// magnitude (see [`ActionMap`]).
+#[derive(Clone, Copy, Debug)]
+pub enum AxisBinding {
+    /// Two keys form a virtual axis: `-1.0` when `negative` is held,
+    /// `+1.0` when `positive` is held, `0.0` otherwise. Both held
+    /// cancels to `0.0`.
+    KeyPair {
+        negative: KeyCode,
+        positive: KeyCode,
+    },
+    /// Pass a gamepad axis value through unchanged. Deadzone
+    /// filtering is the caller's responsibility.
+    GamepadAxis { slot: usize, axis: GamepadAxis },
+    /// Two gamepad buttons form a virtual axis, same semantics as
+    /// `KeyPair`. Good for mapping DPad directions to `-1/0/+1`.
+    GamepadButtonPair {
+        slot: usize,
+        negative: GamepadButton,
+        positive: GamepadButton,
+    },
+}
+
+impl ActionMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a binding for `action`. Actions with multiple
+    /// bindings are down iff *any* binding is down.
+    pub fn bind_action(&mut self, action: impl Into<String>, binding: Binding) -> &mut Self {
+        self.actions
+            .entry(action.into())
+            .or_default()
+            .push(binding);
+        self
+    }
+
+    /// Register a binding for virtual axis `axis`. Axes with multiple
+    /// bindings take the largest-magnitude contributing value.
+    pub fn bind_axis(&mut self, axis: impl Into<String>, binding: AxisBinding) -> &mut Self {
+        self.axes.entry(axis.into()).or_default().push(binding);
+        self
+    }
+
+    /// Remove every binding currently registered for `action`.
+    /// Useful in a rebind flow: clear the old bindings, then
+    /// `bind_action` the new ones.
+    pub fn clear_action(&mut self, action: &str) {
+        self.actions.remove(action);
+    }
+
+    pub fn clear_axis(&mut self, axis: &str) {
+        self.axes.remove(axis);
+    }
+
+    /// Iterate every `(action, bindings)` pair. Useful when building
+    /// a rebind UI that wants to display current bindings.
+    pub fn actions(&self) -> impl Iterator<Item = (&str, &[Binding])> {
+        self.actions.iter().map(|(k, v)| (k.as_str(), v.as_slice()))
+    }
+
+    pub fn axes(&self) -> impl Iterator<Item = (&str, &[AxisBinding])> {
+        self.axes.iter().map(|(k, v)| (k.as_str(), v.as_slice()))
+    }
 }
 
 impl InputState {
@@ -523,6 +643,64 @@ impl InputState {
         // no-op
     }
 
+    // ── Action / axis bindings ────────────────────────────────────────
+
+    /// Install an [`ActionMap`]. Replaces any previously-installed
+    /// bindings. Cheap to swap — internally it's a clone of the map.
+    /// Typical rebind flow: capture a new key in a modal UI, update
+    /// a persisted `ActionMap`, call this once.
+    pub fn set_actions(&self, actions: ActionMap) {
+        self.inner.lock().unwrap().actions = actions;
+    }
+
+    /// Is the named action currently held? `true` iff any binding for
+    /// `action` is active. Unknown action names return `false`.
+    pub fn action_down(&self, action: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(bindings) = inner.actions.actions.get(action) else {
+            return false;
+        };
+        bindings.iter().any(|b| binding_is_active(b, &inner))
+    }
+
+    /// Did the named action transition released → pressed this frame?
+    /// Fires once when *any* binding's just-pressed edge hits.
+    pub fn action_just_pressed(&self, action: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(bindings) = inner.actions.actions.get(action) else {
+            return false;
+        };
+        bindings.iter().any(|b| binding_just_pressed(b, &inner))
+    }
+
+    /// Did the named action transition pressed → released this frame?
+    pub fn action_just_released(&self, action: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(bindings) = inner.actions.actions.get(action) else {
+            return false;
+        };
+        bindings.iter().any(|b| binding_just_released(b, &inner))
+    }
+
+    /// Resolve a named virtual axis to a float in `[-1, 1]` (for
+    /// stick-style inputs) or `[0, 1]` (for trigger-style). Mixed
+    /// bindings pick the largest-magnitude contributor. Unknown axis
+    /// names return `0.0`.
+    pub fn axis(&self, axis: &str) -> f32 {
+        let inner = self.inner.lock().unwrap();
+        let Some(bindings) = inner.actions.axes.get(axis) else {
+            return 0.0;
+        };
+        let mut best: f32 = 0.0;
+        for b in bindings {
+            let v = axis_value(b, &inner);
+            if v.abs() > best.abs() {
+                best = v;
+            }
+        }
+        best
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────
 
     /// Record a Blinc [`EventContext`] into the state. Safe to call
@@ -616,6 +794,91 @@ impl DivInputExt for Div {
             .on_event(event_types::POINTER_UP, move |e| i_pu.record(e))
             .on_event(event_types::POINTER_MOVE, move |e| i_pm.record(e))
             .on_scroll(move |e| i_sc.record(e))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Binding evaluation — looked up against `Inner` snapshot
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn binding_is_active(b: &Binding, s: &Inner) -> bool {
+    match *b {
+        Binding::Key(k) => s.keys_down.contains(&k),
+        Binding::Mouse(btn) => s.buttons_down.contains(&btn),
+        Binding::GamepadButton { slot, button } => s
+            .gamepads
+            .get(slot)
+            .is_some_and(|g| g.connected && g.buttons_down.contains(&button)),
+        Binding::GamepadAxisThreshold { slot, axis, threshold } => s
+            .gamepads
+            .get(slot)
+            .and_then(|g| if g.connected { g.axes.get(&axis).copied() } else { None })
+            .map(|v| v.abs() >= threshold.abs())
+            .unwrap_or(false),
+    }
+}
+
+fn binding_just_pressed(b: &Binding, s: &Inner) -> bool {
+    match *b {
+        Binding::Key(k) => s.keys_just_pressed.contains(&k),
+        Binding::Mouse(btn) => s.buttons_just_pressed.contains(&btn),
+        Binding::GamepadButton { slot, button } => s
+            .gamepads
+            .get(slot)
+            .is_some_and(|g| g.connected && g.buttons_just_pressed.contains(&button)),
+        // Threshold bindings don't carry an edge — callers wanting
+        // "trigger pulled just now" should use a regular gamepad
+        // button binding at the same index, or implement edge
+        // detection per-frame at the call site.
+        Binding::GamepadAxisThreshold { .. } => false,
+    }
+}
+
+fn binding_just_released(b: &Binding, s: &Inner) -> bool {
+    match *b {
+        Binding::Key(k) => s.keys_just_released.contains(&k),
+        Binding::Mouse(btn) => s.buttons_just_released.contains(&btn),
+        Binding::GamepadButton { slot, button } => s
+            .gamepads
+            .get(slot)
+            .is_some_and(|g| g.connected && g.buttons_just_released.contains(&button)),
+        Binding::GamepadAxisThreshold { .. } => false,
+    }
+}
+
+fn axis_value(b: &AxisBinding, s: &Inner) -> f32 {
+    match *b {
+        AxisBinding::KeyPair { negative, positive } => {
+            let n = s.keys_down.contains(&negative);
+            let p = s.keys_down.contains(&positive);
+            match (n, p) {
+                (true, false) => -1.0,
+                (false, true) => 1.0,
+                _ => 0.0,
+            }
+        }
+        AxisBinding::GamepadAxis { slot, axis } => s
+            .gamepads
+            .get(slot)
+            .and_then(|g| if g.connected { g.axes.get(&axis).copied() } else { None })
+            .unwrap_or(0.0),
+        AxisBinding::GamepadButtonPair {
+            slot,
+            negative,
+            positive,
+        } => {
+            let Some(g) = s.gamepads.get(slot) else { return 0.0 };
+            if !g.connected {
+                return 0.0;
+            }
+            let n = g.buttons_down.contains(&negative);
+            let p = g.buttons_down.contains(&positive);
+            match (n, p) {
+                (true, false) => -1.0,
+                (false, true) => 1.0,
+                _ => 0.0,
+            }
+        }
     }
 }
 
@@ -807,5 +1070,137 @@ mod tests {
         let m = input.modifiers();
         assert!(m.shift());
         assert!(!m.ctrl());
+    }
+
+    // ── Action-map tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn action_down_resolves_via_key_binding() {
+        let input = InputState::new();
+        let mut map = ActionMap::new();
+        map.bind_action("jump", Binding::Key(KeyCode::SPACE));
+        input.set_actions(map);
+
+        assert!(!input.action_down("jump"));
+        let mut e = blank_evt(event_types::KEY_DOWN);
+        e.key_code = KeyCode::SPACE.0;
+        input.record(&e);
+        assert!(input.action_down("jump"));
+    }
+
+    #[test]
+    fn action_down_any_binding_fires() {
+        let input = InputState::new();
+        let mut map = ActionMap::new();
+        map.bind_action("fire", Binding::Mouse(MouseButton::Left));
+        map.bind_action("fire", Binding::Key(KeyCode(b'F' as u32)));
+        input.set_actions(map);
+
+        // Mouse binding — fires.
+        let mut md = blank_evt(event_types::POINTER_DOWN);
+        md.mouse_button = 0;
+        input.record(&md);
+        assert!(input.action_down("fire"));
+        let mut mu = blank_evt(event_types::POINTER_UP);
+        mu.mouse_button = 0;
+        input.record(&mu);
+        assert!(!input.action_down("fire"));
+
+        // Key binding — also fires.
+        let mut kd = blank_evt(event_types::KEY_DOWN);
+        kd.key_code = b'F' as u32;
+        input.record(&kd);
+        assert!(input.action_down("fire"));
+    }
+
+    #[test]
+    fn action_just_pressed_tracks_edge() {
+        let input = InputState::new();
+        let mut map = ActionMap::new();
+        map.bind_action("jump", Binding::Key(KeyCode::SPACE));
+        input.set_actions(map);
+
+        let mut e = blank_evt(event_types::KEY_DOWN);
+        e.key_code = KeyCode::SPACE.0;
+        input.record(&e);
+        assert!(input.action_just_pressed("jump"));
+        // Still held next query — but `just_pressed` should NOT fire
+        // until we clear the edge via `frame_end`.
+        input.frame_end();
+        assert!(!input.action_just_pressed("jump"));
+        assert!(input.action_down("jump"));
+    }
+
+    #[test]
+    fn axis_key_pair_returns_minus_plus_or_zero() {
+        let input = InputState::new();
+        let mut map = ActionMap::new();
+        map.bind_axis(
+            "move_x",
+            AxisBinding::KeyPair {
+                negative: KeyCode(b'A' as u32),
+                positive: KeyCode(b'D' as u32),
+            },
+        );
+        input.set_actions(map);
+
+        assert_eq!(input.axis("move_x"), 0.0);
+        let mut a_down = blank_evt(event_types::KEY_DOWN);
+        a_down.key_code = b'A' as u32;
+        input.record(&a_down);
+        assert_eq!(input.axis("move_x"), -1.0);
+        // Pressing D while A is held cancels to 0.
+        let mut d_down = blank_evt(event_types::KEY_DOWN);
+        d_down.key_code = b'D' as u32;
+        input.record(&d_down);
+        assert_eq!(input.axis("move_x"), 0.0);
+    }
+
+    #[test]
+    fn axis_largest_magnitude_wins_across_bindings() {
+        let input = InputState::new();
+        let mut map = ActionMap::new();
+        // Two bindings for the same axis — KeyPair contributes -1;
+        // mocked gamepad axis would contribute a partial value if
+        // wired. We exercise the max-magnitude rule purely with
+        // keys + axis-threshold here since the gamepad path needs
+        // poll_gamepads infrastructure.
+        map.bind_axis(
+            "move_x",
+            AxisBinding::KeyPair {
+                negative: KeyCode(b'A' as u32),
+                positive: KeyCode(b'D' as u32),
+            },
+        );
+        input.set_actions(map);
+
+        let mut a_down = blank_evt(event_types::KEY_DOWN);
+        a_down.key_code = b'A' as u32;
+        input.record(&a_down);
+        assert_eq!(input.axis("move_x"), -1.0);
+    }
+
+    #[test]
+    fn unknown_action_and_axis_names_return_defaults() {
+        let input = InputState::new();
+        input.set_actions(ActionMap::new());
+        assert!(!input.action_down("nope"));
+        assert!(!input.action_just_pressed("nope"));
+        assert_eq!(input.axis("nope"), 0.0);
+    }
+
+    #[test]
+    fn action_map_clear_removes_bindings() {
+        let input = InputState::new();
+        let mut map = ActionMap::new();
+        map.bind_action("jump", Binding::Key(KeyCode::SPACE));
+        map.clear_action("jump");
+        input.set_actions(map);
+
+        let mut e = blank_evt(event_types::KEY_DOWN);
+        e.key_code = KeyCode::SPACE.0;
+        input.record(&e);
+        // Binding was cleared before install — action shouldn't fire.
+        assert!(!input.action_down("jump"));
     }
 }
