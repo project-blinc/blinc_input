@@ -6,17 +6,22 @@ Outstanding work, ordered by demand.
 
 ## Gamepad support
 
-- [ ] **Core gamepad polling** via `gilrs`
-  - **Why:** Controllers are first-class input on desktop game demos
-    and console targets.
-  - **How:** Add an optional `gamepad` feature pulling in `gilrs`.
-    Expose `input.gamepad(0).button_down(Button::A)`,
-    `input.gamepad(0).axis(Axis::LeftX)`, `input.gamepads()` iterator.
-    Poll every frame from a helper and feed internal state; no Blinc
-    event integration needed (gilrs does its own input pump).
+- [x] **Core gamepad polling.** `gamepad` feature gates both desktop
+  (gilrs 0.11) and wasm (Web Gamepad API via web-sys) backends.
+  `InputState::poll_gamepads()` drains controller events into
+  per-slot `GamepadSnapshot`s; query with
+  `is_gamepad_button_down(slot, GamepadButton::South)`,
+  `gamepad_axis(slot, GamepadAxis::LeftStickX)`, etc. Button enum
+  uses the South/East/West/North convention so Xbox / PlayStation
+  / Switch Pro all share one API. Web path uses the Standard
+  Gamepad layout (covers DualShock / DualSense / Xbox / generic
+  XInput — browsers remap them identically).
 
-- [ ] **Connection change events** so sketches can react to a
-  controller being plugged in or removed.
+- [ ] **Connection change events.** Currently connection state is
+  exposed via the `connected` flag on `GamepadSnapshot` and
+  `is_gamepad_connected(i)`. Dispatching a one-shot event on
+  transitions would let sketches react (re-bind UI, update HUD)
+  without a per-frame equality check against last frame's state.
 
 ---
 

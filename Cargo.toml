@@ -18,3 +18,29 @@ categories = ["game-development", "gui"]
 # the example snippet. Bump in lockstep with the upstream commits.
 blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "335f6fc85c5a60a5e3307a74707d83a21861a31b" }
 blinc_layout = { git = "https://github.com/project-blinc/Blinc.git", rev = "335f6fc85c5a60a5e3307a74707d83a21861a31b" }
+tracing = "0.1"
+
+# Optional gamepad support. Gated behind the `gamepad` feature so
+# pure keyboard / mouse consumers don't pull in the HID stack.
+# Desktop uses gilrs; wasm uses the browser's Web Gamepad API via
+# web-sys (covers DualShock, Xbox, Switch Pro, etc. — browsers
+# normalise all of them to the "Standard Gamepad" layout).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gilrs = { version = "0.11", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", optional = true, features = [
+    "Gamepad",
+    "GamepadButton",
+    "Navigator",
+    "Window",
+] }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = []
+# Enable the `gamepad` API on `InputState` (gamepad_count,
+# is_gamepad_button_down, gamepad_axis, ...). Pulls in gilrs on
+# desktop and the Web Gamepad bindings on wasm.
+gamepad = ["dep:gilrs", "dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]

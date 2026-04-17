@@ -121,6 +121,75 @@ struct Inner {
     scroll_delta_x: f32,
     scroll_delta_y: f32,
     modifiers: Modifiers,
+    /// Per-gamepad state. Indexed by gamepad slot; lazily grown as
+    /// new gamepads connect. Empty without the `gamepad` feature.
+    gamepads: Vec<GamepadSnapshot>,
+    /// Backend driving `gamepads`. `None` means "not initialised yet
+    /// (or `gamepad` feature not compiled)". Behind a Mutex via the
+    /// outer `Inner`.
+    #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
+    gilrs: Option<gilrs::Gilrs>,
+    /// gilrs → slot mapping. A freshly connected gamepad claims the
+    /// first free slot so indices stay compact as controllers come
+    /// and go.
+    #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
+    gamepad_slots: std::collections::HashMap<gilrs::GamepadId, usize>,
+}
+
+/// Per-gamepad polling state. Populated by
+/// [`InputState::poll_gamepads`] each frame from the active backend
+/// (gilrs on desktop; Web Gamepad API planned for wasm).
+#[derive(Debug, Default, Clone)]
+pub struct GamepadSnapshot {
+    /// Whether this slot currently has a connected controller. If
+    /// `false`, all `is_gamepad_button_down` / `gamepad_axis` reads
+    /// return their default (`false` / `0.0`).
+    pub connected: bool,
+    pub buttons_down: HashSet<GamepadButton>,
+    pub buttons_just_pressed: HashSet<GamepadButton>,
+    pub buttons_just_released: HashSet<GamepadButton>,
+    pub axes: std::collections::HashMap<GamepadAxis, f32>,
+}
+
+/// Normalised gamepad button identifier. Mapping is middleware-provided
+/// (gilrs on desktop) and follows the "south / east / west / north"
+/// convention so the API stays stable across Xbox, PlayStation, and
+/// Switch Pro layouts — callers write
+/// `is_gamepad_button_down(0, GamepadButton::South)` instead of picking
+/// between "A" and "Cross" per platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GamepadButton {
+    South,          // A / Cross / B (Nintendo layout)
+    East,           // B / Circle / A
+    West,           // X / Square / Y
+    North,          // Y / Triangle / X
+    LeftShoulder,
+    RightShoulder,
+    LeftTrigger,    // Digital press — use `GamepadAxis::LeftTrigger` for analog
+    RightTrigger,
+    Select,         // Back / Share
+    Start,          // Menu / Options
+    LeftThumb,      // L3 — pressing the stick down
+    RightThumb,     // R3
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+    Mode,           // Xbox / PS home button. Some platforms reserve it.
+}
+
+/// Normalised gamepad analog axis. Stick axes run `-1.0 ..= 1.0`
+/// (up / right positive). Triggers run `0.0 ..= 1.0`. Deadzone
+/// handling is the caller's job — we pass middleware values through
+/// unfiltered so games can pick their own curves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GamepadAxis {
+    LeftStickX,
+    LeftStickY,
+    RightStickX,
+    RightStickY,
+    LeftTrigger,
+    RightTrigger,
 }
 
 impl InputState {
@@ -191,6 +260,267 @@ impl InputState {
     /// Current keyboard modifier flags (shift / ctrl / alt / meta).
     pub fn modifiers(&self) -> Modifiers {
         self.inner.lock().unwrap().modifiers
+    }
+
+    // ── Gamepad queries ───────────────────────────────────────────────
+    //
+    // All methods degrade gracefully when the `gamepad` feature isn't
+    // compiled, or when no controller is connected to the requested
+    // slot — `count` is `0`, buttons read as released, axes as `0.0`.
+    // Call [`Self::poll_gamepads`] once per frame to drain middleware
+    // events into the snapshot these queries read.
+
+    /// Number of gamepads the backend has seen (including disconnected
+    /// slots whose state is retained for stability of indices across
+    /// reconnects). `is_gamepad_connected(i)` narrows to live slots.
+    pub fn gamepad_count(&self) -> usize {
+        self.inner.lock().unwrap().gamepads.len()
+    }
+
+    /// Whether gamepad `i` is currently plugged in.
+    pub fn is_gamepad_connected(&self, gamepad: usize) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .gamepads
+            .get(gamepad)
+            .is_some_and(|g| g.connected)
+    }
+
+    /// Is `button` currently held on gamepad `gamepad`?
+    pub fn is_gamepad_button_down(&self, gamepad: usize, button: GamepadButton) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .gamepads
+            .get(gamepad)
+            .is_some_and(|g| g.connected && g.buttons_down.contains(&button))
+    }
+
+    /// Did `button` transition down → up this frame?
+    pub fn is_gamepad_button_just_pressed(&self, gamepad: usize, button: GamepadButton) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .gamepads
+            .get(gamepad)
+            .is_some_and(|g| g.connected && g.buttons_just_pressed.contains(&button))
+    }
+
+    /// Did `button` transition up → down this frame?
+    pub fn is_gamepad_button_just_released(&self, gamepad: usize, button: GamepadButton) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .gamepads
+            .get(gamepad)
+            .is_some_and(|g| g.connected && g.buttons_just_released.contains(&button))
+    }
+
+    /// Current analog value for `axis` on gamepad `gamepad`. Sticks
+    /// return `-1.0 ..= 1.0`, triggers `0.0 ..= 1.0`. No deadzone
+    /// is applied — filter per-axis at the call site.
+    pub fn gamepad_axis(&self, gamepad: usize, axis: GamepadAxis) -> f32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .gamepads
+            .get(gamepad)
+            .and_then(|g| if g.connected { g.axes.get(&axis).copied() } else { None })
+            .unwrap_or(0.0)
+    }
+
+    /// Drive the gamepad backend — drains pending controller events
+    /// and updates the per-slot snapshot. Call once per frame before
+    /// any gamepad queries (or not at all if you aren't using
+    /// gamepads — cheap no-op when the feature's off).
+    #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
+    pub fn poll_gamepads(&self) {
+        use gilrs::{Button, EventType};
+        let mut inner = self.inner.lock().unwrap();
+        // Lazy-init gilrs on the first poll so the HID subsystem
+        // isn't touched by callers who never ask for gamepads.
+        if inner.gilrs.is_none() {
+            match gilrs::Gilrs::new() {
+                Ok(g) => inner.gilrs = Some(g),
+                Err(e) => {
+                    tracing::warn!("gilrs init failed: {e:?}");
+                    return;
+                }
+            }
+        }
+        // Edge state persists for exactly one frame — clear before
+        // draining new events so `just_pressed` reflects only this
+        // frame's transitions.
+        for g in inner.gamepads.iter_mut() {
+            g.buttons_just_pressed.clear();
+            g.buttons_just_released.clear();
+        }
+        // Drain every pending controller event.
+        while let Some(event) = inner.gilrs.as_mut().and_then(|g| g.next_event()) {
+            // Assign a slot index the first time we see a gamepad id.
+            // Two-step lookup to keep the borrow checker happy — we
+            // can't touch `inner.gamepads` inside an `or_insert_with`
+            // closure that itself borrows `inner.gamepad_slots`.
+            let slot = if let Some(&s) = inner.gamepad_slots.get(&event.id) {
+                s
+            } else {
+                let idx = inner.gamepads.len();
+                inner.gamepads.push(GamepadSnapshot::default());
+                inner.gamepad_slots.insert(event.id, idx);
+                idx
+            };
+            if slot >= inner.gamepads.len() {
+                // Shouldn't happen but be defensive.
+                continue;
+            }
+            let snap = &mut inner.gamepads[slot];
+            match event.event {
+                EventType::Connected => snap.connected = true,
+                EventType::Disconnected => {
+                    snap.connected = false;
+                    snap.buttons_down.clear();
+                    snap.axes.clear();
+                }
+                EventType::ButtonPressed(btn, _) => {
+                    if let Some(b) = map_gilrs_button(btn) {
+                        if snap.buttons_down.insert(b) {
+                            snap.buttons_just_pressed.insert(b);
+                        }
+                    }
+                }
+                EventType::ButtonReleased(btn, _) => {
+                    if let Some(b) = map_gilrs_button(btn) {
+                        if snap.buttons_down.remove(&b) {
+                            snap.buttons_just_released.insert(b);
+                        }
+                    }
+                }
+                EventType::AxisChanged(axis, value, _) => {
+                    if let Some(a) = map_gilrs_axis(axis) {
+                        snap.axes.insert(a, value);
+                    }
+                }
+                // ButtonChanged covers analog trigger values. gilrs
+                // reports L2/R2 as buttons whose "value" ranges
+                // 0..1 — record as the corresponding Trigger axis so
+                // the analog read works alongside the digital flag.
+                EventType::ButtonChanged(btn, value, _) => {
+                    let axis = match btn {
+                        Button::LeftTrigger2 => Some(GamepadAxis::LeftTrigger),
+                        Button::RightTrigger2 => Some(GamepadAxis::RightTrigger),
+                        _ => None,
+                    };
+                    if let Some(a) = axis {
+                        snap.axes.insert(a, value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Poll the browser's Web Gamepad API via `navigator.getGamepads()`.
+    /// Works with DualShock, Xbox, Switch Pro, and any other
+    /// controller the browser exposes — the spec normalises all of
+    /// them to the "Standard Gamepad" button layout, so our enum
+    /// mapping (see [`map_web_button_index`]) stays one-to-one with
+    /// the array index regardless of controller brand.
+    #[cfg(all(feature = "gamepad", target_arch = "wasm32"))]
+    pub fn poll_gamepads(&self) {
+        use wasm_bindgen::JsCast;
+        let mut inner = self.inner.lock().unwrap();
+        let Some(window) = web_sys::window() else { return; };
+        let Ok(pads_js) = window.navigator().get_gamepads() else { return; };
+        let pads = js_sys::Array::from(&pads_js);
+
+        // Grow snapshot vec to match the browser's slot count. Empty
+        // slots stay `connected = false`.
+        while inner.gamepads.len() < pads.length() as usize {
+            inner.gamepads.push(GamepadSnapshot::default());
+        }
+
+        for (slot, pad_val) in pads.iter().enumerate() {
+            if slot >= inner.gamepads.len() {
+                break;
+            }
+            // A missing gamepad is represented as `null`.
+            let Ok(pad) = pad_val.dyn_into::<web_sys::Gamepad>() else {
+                let snap = &mut inner.gamepads[slot];
+                if snap.connected {
+                    snap.connected = false;
+                    snap.buttons_down.clear();
+                    snap.axes.clear();
+                }
+                continue;
+            };
+
+            // Edge state is this-frame-only. Clear before repopulating.
+            let snap = &mut inner.gamepads[slot];
+            snap.buttons_just_pressed.clear();
+            snap.buttons_just_released.clear();
+            snap.connected = pad.connected();
+
+            // Buttons: the Standard Gamepad layout defines index → role.
+            let buttons = pad.buttons();
+            for i in 0..buttons.length() {
+                let Some(button) = buttons.get(i).dyn_ref::<web_sys::GamepadButton>().cloned()
+                else {
+                    continue;
+                };
+                let Some(mapped) = map_web_button_index(i) else { continue; };
+                let pressed = button.pressed();
+                let was_down = snap.buttons_down.contains(&mapped);
+                if pressed && !was_down {
+                    snap.buttons_down.insert(mapped);
+                    snap.buttons_just_pressed.insert(mapped);
+                } else if !pressed && was_down {
+                    snap.buttons_down.remove(&mapped);
+                    snap.buttons_just_released.insert(mapped);
+                }
+                // Analog trigger value: the browser exposes 0..1 via
+                // `GamepadButton.value`; mirror into the axis sink so
+                // the same accessor works for gilrs + web.
+                let axis = match i {
+                    6 => Some(GamepadAxis::LeftTrigger),
+                    7 => Some(GamepadAxis::RightTrigger),
+                    _ => None,
+                };
+                if let Some(a) = axis {
+                    snap.axes.insert(a, button.value() as f32);
+                }
+            }
+
+            // Axes: Standard Gamepad layout uses indices 0..4 for
+            // LeftStickX/Y, RightStickX/Y. Browsers invert Y
+            // relative to gilrs (web: +Y is down), but the `Standard`
+            // mapping guarantee means indices are stable.
+            let axes = pad.axes();
+            let axis_map = [
+                GamepadAxis::LeftStickX,
+                GamepadAxis::LeftStickY,
+                GamepadAxis::RightStickX,
+                GamepadAxis::RightStickY,
+            ];
+            for (i, a) in axis_map.iter().enumerate() {
+                let Some(v) = axes.get(i as u32).as_f64() else { continue; };
+                // Web Y is down-positive; flip so consumers get the
+                // same sign convention as gilrs (up-positive).
+                let signed = if matches!(a, GamepadAxis::LeftStickY | GamepadAxis::RightStickY) {
+                    -v as f32
+                } else {
+                    v as f32
+                };
+                snap.axes.insert(*a, signed);
+            }
+        }
+    }
+
+    /// No-op when the `gamepad` feature isn't enabled. Kept for API
+    /// symmetry so callers don't need to cfg-guard the call site.
+    #[cfg(not(feature = "gamepad"))]
+    pub fn poll_gamepads(&self) {
+        // no-op
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────
@@ -287,6 +617,79 @@ impl DivInputExt for Div {
             .on_event(event_types::POINTER_MOVE, move |e| i_pm.record(e))
             .on_scroll(move |e| i_sc.record(e))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gilrs ↔ Blinc enum mapping (desktop, behind the `gamepad` feature)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
+fn map_gilrs_button(btn: gilrs::Button) -> Option<GamepadButton> {
+    use gilrs::Button::*;
+    Some(match btn {
+        South => GamepadButton::South,
+        East => GamepadButton::East,
+        West => GamepadButton::West,
+        North => GamepadButton::North,
+        LeftTrigger => GamepadButton::LeftShoulder,
+        RightTrigger => GamepadButton::RightShoulder,
+        LeftTrigger2 => GamepadButton::LeftTrigger,
+        RightTrigger2 => GamepadButton::RightTrigger,
+        Select => GamepadButton::Select,
+        Start => GamepadButton::Start,
+        LeftThumb => GamepadButton::LeftThumb,
+        RightThumb => GamepadButton::RightThumb,
+        DPadUp => GamepadButton::DPadUp,
+        DPadDown => GamepadButton::DPadDown,
+        DPadLeft => GamepadButton::DPadLeft,
+        DPadRight => GamepadButton::DPadRight,
+        Mode => GamepadButton::Mode,
+        Unknown | C | Z => return None,
+    })
+}
+
+/// Map a Web Gamepad API button-array index to our normalised enum.
+/// Follows the "Standard Gamepad" mapping defined in the W3C Gamepad
+/// spec, which every major browser implements identically for
+/// DualShock / DualSense, Xbox, Switch Pro, and generic XInput pads.
+#[cfg(all(feature = "gamepad", target_arch = "wasm32"))]
+fn map_web_button_index(i: u32) -> Option<GamepadButton> {
+    Some(match i {
+        0 => GamepadButton::South,          // Cross / A
+        1 => GamepadButton::East,           // Circle / B
+        2 => GamepadButton::West,           // Square / X
+        3 => GamepadButton::North,          // Triangle / Y
+        4 => GamepadButton::LeftShoulder,   // L1 / LB
+        5 => GamepadButton::RightShoulder,  // R1 / RB
+        6 => GamepadButton::LeftTrigger,    // L2 / LT (digital press)
+        7 => GamepadButton::RightTrigger,   // R2 / RT
+        8 => GamepadButton::Select,         // Share / Back
+        9 => GamepadButton::Start,          // Options / Menu
+        10 => GamepadButton::LeftThumb,     // L3 (stick press)
+        11 => GamepadButton::RightThumb,    // R3
+        12 => GamepadButton::DPadUp,
+        13 => GamepadButton::DPadDown,
+        14 => GamepadButton::DPadLeft,
+        15 => GamepadButton::DPadRight,
+        16 => GamepadButton::Mode,          // PS button / Xbox home
+        _ => return None,
+    })
+}
+
+#[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
+fn map_gilrs_axis(axis: gilrs::Axis) -> Option<GamepadAxis> {
+    use gilrs::Axis::*;
+    Some(match axis {
+        LeftStickX => GamepadAxis::LeftStickX,
+        LeftStickY => GamepadAxis::LeftStickY,
+        RightStickX => GamepadAxis::RightStickX,
+        RightStickY => GamepadAxis::RightStickY,
+        LeftZ => GamepadAxis::LeftTrigger,
+        RightZ => GamepadAxis::RightTrigger,
+        // DPad-as-axis (some drivers expose it this way) and
+        // unknown axes are handled as button events elsewhere.
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
