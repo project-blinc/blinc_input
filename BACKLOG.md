@@ -70,16 +70,18 @@ Outstanding work, ordered by demand.
 
 ## Ergonomics
 
-- [ ] **SketchContext integration**
-  - Helper in `blinc_canvas_kit` that accepts a `Sketch` wrapper
-    providing `ctx.input() -> &InputState`. Would avoid the manual
-    `capture_input` step but requires a `blinc_canvas_kit` dep —
-    either add it behind a feature here or wire on the canvas-kit
-    side.
-
-- [ ] **Auto frame_end**
-  - Opt-in: register a redraw / frame hook that calls `frame_end`
-    automatically so users can't forget it.
+- [x] **Automated `capture_input` + `frame_end` wiring for 3D scenes**
+  — resolved on the canvas-kit side as
+  `SceneKit3D::with_input(&InputState)` (Blinc commit 922cb316).
+  Caller keeps owning the `InputState` and accessing it via
+  closure capture; the kit handles `capture_input` on the outer
+  `Div` and `frame_end()` per paint. The original framing
+  (`ctx.input() -> &InputState` + a `Sketch` wrapper) turned out
+  to be the wrong shape: readers already have the state through
+  closure capture, so rerouting access through a new context
+  type would trade one ergonomic problem for another. Implemented
+  without a feature gate because `blinc_input` is small and
+  canvas_kit's 3D scene use-case always wants it.
 
 ---
 
